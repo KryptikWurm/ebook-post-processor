@@ -49,6 +49,8 @@ DRY_RUN = False
 DELETE_FILES = 0          # del_files flag for the SAB history delete call (0 = entry only)
 API_TIMEOUT = 15          # seconds for the SABnzbd API call
 OVERWRITE = False         # if a dest file already exists, skip (non-destructive) by default
+RENAME = True             # rename filed eBooks to "{Author} - {Title}{ext}"; keep the
+                          # original name when no title can be determined
 # SABnzbd won't delete a job from history while its post-processing script is
 # still running, so the history delete is deferred to a detached child that
 # waits this many seconds (until this script has exited and the job is marked
@@ -110,13 +112,12 @@ def find_ebooks(root):
                 found.append(os.path.join(dirpath, name))
     return sorted(found)
 
-def extract_epub_author(path):
-    """Return the author named in an EPUB's metadata (dc:creator), or None.
+def read_opf_root(path):
+    """Open an EPUB and return its parsed OPF package root element, or None.
 
-    Reads META-INF/container.xml to locate the OPF package document, then parses
-    its <dc:creator> entries, preferring one tagged with the 'aut' role. Any
-    structural problem (not a zip, missing parts, bad XML) yields None so the
-    caller can fall back to filename parsing."""
+    Reads META-INF/container.xml to locate the OPF package document. Any
+    structural problem (not a zip, missing parts, bad XML) yields None so callers
+    can fall back to filename parsing."""
     try:
         with zipfile.ZipFile(path) as zf:
             with zf.open("META-INF/container.xml") as cf:
@@ -129,11 +130,20 @@ def extract_epub_author(path):
             if not opf_path:
                 return None
             with zf.open(opf_path) as of:
-                opf = ET.parse(of).getroot()
+                return ET.parse(of).getroot()
     except (zipfile.BadZipFile, KeyError, ET.ParseError, OSError) as e:
         log.debug("  EPUB metadata read failed on %s: %s", os.path.basename(path), e)
         return None
 
+def extract_epub_author(path):
+    """Return the author named in an EPUB's metadata (dc:creator), or None.
+
+    Parses the OPF's <dc:creator> entries, preferring one tagged with the 'aut'
+    role. Returns None on any structural problem so the caller can fall back to
+    filename parsing."""
+    opf = read_opf_root(path)
+    if opf is None:
+        return None
     creators = opf.findall(".//dc:creator", OPF_NS)
     if not creators:
         return None
@@ -148,32 +158,70 @@ def extract_epub_author(path):
             return c.text.strip()
     return None
 
+def extract_epub_title(path):
+    """Return the title named in an EPUB's metadata (dc:title), or None.
+
+    Returns None on any structural problem so the caller can fall back to
+    filename parsing."""
+    opf = read_opf_root(path)
+    if opf is None:
+        return None
+    for t in opf.findall(".//dc:title", OPF_NS):
+        if (t.text or "").strip():
+            return t.text.strip()
+    return None
+
+def _strip_ebook_ext(name):
+    """Drop a trailing eBook extension from a name, if present."""
+    for ext in EBOOK_EXTS:
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return name
+
 def parse_author_from_name(name):
     """Extract the author from a 'Author - Title' name, or None.
 
     Strips any eBook extension first, then takes the text before the first
     ' - ' delimiter."""
-    base = name
-    for ext in EBOOK_EXTS:
-        if base.lower().endswith(ext):
-            base = base[: -len(ext)]
-            break
+    base = _strip_ebook_ext(name)
     if " - " not in base:
         return None
     author = base.split(" - ", 1)[0].strip()
     return author or None
 
-def sanitize_author(name):
-    """Make an author string safe to use as a single path component.
+def parse_title_from_name(name):
+    """Extract the title from a 'Author - Title' name, or None.
+
+    Strips any eBook extension first, then takes the text after the first
+    ' - ' delimiter."""
+    base = _strip_ebook_ext(name)
+    if " - " not in base:
+        return None
+    title = base.split(" - ", 1)[1].strip()
+    return title or None
+
+def sanitize_component(name):
+    """Make a string safe to use as a single path component.
 
     Strips filesystem-illegal characters, collapses whitespace, and trims
-    leading/trailing dots and spaces. Falls back to UNKNOWN_AUTHOR if nothing
-    usable remains."""
-    if not name:
-        return UNKNOWN_AUTHOR
-    cleaned = re.sub(r'[\\/:*?"<>|]', "", name)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip().strip(".").strip()
-    return cleaned or UNKNOWN_AUTHOR
+    leading/trailing dots and spaces. May return '' if nothing usable remains."""
+    cleaned = re.sub(r'[\\/:*?"<>|]', "", name or "")
+    return re.sub(r"\s+", " ", cleaned).strip().strip(".").strip()
+
+def sanitize_author(name):
+    """Sanitize an author into a path component, falling back to UNKNOWN_AUTHOR."""
+    return sanitize_component(name) or UNKNOWN_AUTHOR
+
+def sanitize_title(name):
+    """Sanitize a title for use in a filename.
+
+    A subtitle colon is turned into a ' - ' separator ('Empire: Mistborn' ->
+    'Empire - Mistborn') before the colon would otherwise be stripped as an
+    illegal character; any separator left dangling by a trailing colon is
+    dropped. May return ''."""
+    name = re.sub(r"\s*:\s*", " - ", name or "")
+    cleaned = sanitize_component(name)
+    return re.sub(r"\s*-\s*$", "", cleaned).strip()
 
 def determine_author(path, job_name):
     """Resolve the destination author folder for an eBook.
@@ -195,13 +243,48 @@ def determine_author(path, job_name):
         log.warning("  Author not found; using %r.", UNKNOWN_AUTHOR)
     return sanitize_author(author)
 
-def move_ebook(path, author, dry_run=False):
-    """Move one eBook into EBOOK_DEST/<author>/. Returns True on success.
+def determine_title(path, job_name):
+    """Resolve the book title for renaming, or None if it can't be found.
 
-    A pre-existing destination file is left untouched (skip + warn) unless
-    OVERWRITE is set, so a re-download never silently clobbers the library."""
+    EPUB metadata first, then 'Author - Title' parsing of the filename and the
+    SABnzbd job name. Returns None (caller keeps the original filename) when no
+    title can be determined; the result is otherwise raw (sanitized at use)."""
+    title = None
+    if path.lower().endswith(".epub"):
+        title = extract_epub_title(path)
+        if title:
+            log.info("  Title from EPUB metadata: %s", title)
+    if not title:
+        title = parse_title_from_name(os.path.basename(path))
+        if not title and job_name:
+            title = parse_title_from_name(job_name)
+        if title:
+            log.info("  Title from name: %s", title)
+    return title
+
+def target_filename(path, author, title):
+    """Build the filename to file an eBook under, keeping its extension.
+
+    With RENAME on and a known title, returns '{Author} - {Title}{ext}';
+    otherwise the original filename is preserved (NO renaming)."""
+    original = os.path.basename(path)
+    if not RENAME:
+        return original
+    safe_title = sanitize_title(title) if title else ""
+    if not safe_title:
+        return original
+    ext = os.path.splitext(original)[1]
+    return "%s - %s%s" % (author, safe_title, ext)
+
+def move_ebook(path, author, dest_name=None, dry_run=False):
+    """Move one eBook into EBOOK_DEST/<author>/ as dest_name. Returns True on
+    success.
+
+    dest_name defaults to the file's original basename. A pre-existing
+    destination file is left untouched (skip + warn) unless OVERWRITE is set, so
+    a re-download never silently clobbers the library."""
     dest_dir = os.path.join(EBOOK_DEST, author)
-    dest = os.path.join(dest_dir, os.path.basename(path))
+    dest = os.path.join(dest_dir, dest_name or os.path.basename(path))
 
     if os.path.exists(dest) and not OVERWRITE:
         log.warning("  Destination already exists, skipping: %s", dest)
@@ -355,7 +438,10 @@ def main():
         log.info("Filing: %s", os.path.basename(path))
         try:
             author = determine_author(path, job_name)
-            if move_ebook(path, author, DRY_RUN):
+            dest_name = target_filename(path, author, determine_title(path, job_name))
+            if dest_name != os.path.basename(path):
+                log.info("  Filing as: %s", dest_name)
+            if move_ebook(path, author, dest_name, DRY_RUN):
                 moved += 1
         except Exception as e:
             log.error("Unexpected error filing %s: %s", os.path.basename(path), e)

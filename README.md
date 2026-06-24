@@ -14,6 +14,7 @@ It leans on the book's own EPUB metadata to get the author right, and falls back
   - [Contents](#contents)
   - [Features](#features)
   - [How author detection works](#how-author-detection-works)
+  - [How renaming works](#how-renaming-works)
   - [SABnzbd setup](#sabnzbd-setup)
     - [Category setup (run it automatically, no manual post-processing)](#category-setup-run-it-automatically-no-manual-post-processing)
     - [Can the .nzb file set the category itself?](#can-the-nzb-file-set-the-category-itself)
@@ -30,6 +31,7 @@ It leans on the book's own EPUB metadata to get the author right, and falls back
 ## Features
 
 - **Files books by author:** every eBook lands in `{EBOOK_DEST}/{Author Name}/` (the mounted NAS library, `/books` by default), created on demand. No more hunting through release-group folders.
+- **Renames to a clean `Author - Title`:** the filed book is renamed to `{Author Name} - {Book Title}` (original extension kept), pulling the title from EPUB metadata or the download name. Can't find a title? It keeps the original filename untouched. Turn it off with `RENAME = False`.
 - **Reads the book's own metadata:** for EPUBs it cracks open the file and reads the real author out of the embedded metadata, so "Brandon Sanderson" beats whatever the filename happened to say.
 - **Sensible fallback chain:** no metadata? It parses the author out of the `Author - Title` download name. Still nothing? The book goes to an `Unknown Author` folder instead of getting lost.
 - **Format-aware:** moves the formats you actually read — `.epub`, `.mobi`, `.azw3`, `.azw`, `.pdf` — and ignores the NFOs, cover thumbnails and samples littering the folder.
@@ -48,6 +50,16 @@ Getting the author folder right is the whole point, so the script tries hardest 
 3. **`Unknown Author`.** If neither yields anything, the book is filed under `Unknown Author` rather than being skipped or lost.
 
 Whatever name comes out is sanitized into a safe folder name: illegal characters stripped, whitespace collapsed, stray dots and spaces trimmed.
+
+## How renaming works
+
+With `RENAME = True` (the default), the filed book is renamed to `{Author Name} - {Book Title}` while keeping its original extension. The title is resolved with the same try-hardest-first chain as the author:
+
+1. **EPUB metadata** (`dc:title`).
+2. **The download name** — the text *after* the first ` - ` in the `Author - Title` convention (filename first, then the SABnzbd job name).
+3. **No title found → no rename.** The file keeps its original name verbatim rather than guessing.
+
+Both the author and title are sanitized for the filesystem (illegal characters stripped, whitespace collapsed, stray dots/spaces trimmed). A subtitle colon in the title is turned into a ` - ` separator rather than dropped, so `The Final Empire: Mistborn Book One` files as `… - The Final Empire - Mistborn Book One`. Set `RENAME = False` to always keep original filenames.
 
 ## SABnzbd setup
 
@@ -142,6 +154,7 @@ EBOOK_EXTS   = (".epub", ".mobi", ".azw3", ".azw", ".pdf")
 LOG_FILE     = "/config/ebook_pp.log"            # change to a persistent path
 DRY_RUN      = False                             # True = log only, change nothing
 OVERWRITE    = False                             # True = replace existing books
+RENAME       = True                              # rename to "Author - Title"; keep original name if no title
 DELETE_FILES = 0                                 # del_files flag for the history delete
 HISTORY_DELETE_DELAY = 30                        # seconds to wait before the deferred history delete
 SAB_API_URL_DEFAULT = "https://nzb.example.com/api"  # fallback if SAB_API_URL is unset
@@ -154,8 +167,8 @@ Always do a dry run first on a new setup (`DRY_RUN = True`). Look at the log, co
 For each finished download, in order:
 
 1. **Find the books.** Walk the completed job folder and collect the eBook-format files, ignoring everything else.
-2. **Resolve the author** for each book (metadata → name → `Unknown Author`).
-3. **Move** each book to `{EBOOK_DEST}/{Author Name}/` (the mounted NAS library, `/books` by default).
+2. **Resolve the author and title** for each book (metadata → name → `Unknown Author`; title left as-is if not found).
+3. **Move** each book to `{EBOOK_DEST}/{Author Name}/` (the mounted NAS library, `/books` by default), renaming it to `{Author Name} - {Book Title}` unless `RENAME = False` or no title was found.
 4. **Only if every book moved cleanly:** delete the completed job folder under `/downloads/completed`, then remove the job's entry from SABnzbd via its History API (`del_files=0`, since the files are already gone). The history removal is *deferred* — see below.
 
 > **Why the history removal is deferred.** SABnzbd won't delete a job from history while that job's own post-processing script is still running — it isn't considered "finished" yet, so a delete call made mid-script is silently ignored. To work around this, the script spawns a small detached background process that waits `HISTORY_DELETE_DELAY` seconds (30 by default), by which point this script has exited and SABnzbd has marked the job finished, and *then* makes the delete call. So the entry disappears from history a few seconds after the rest of the work completes, not instantly.

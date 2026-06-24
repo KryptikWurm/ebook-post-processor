@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Rename filed eBooks to `{Author Name} - {Book Title}`.** When a book is filed it is now renamed to the `Author - Title` convention (original extension preserved). The title is resolved with the same try-hardest-first chain as the author: EPUB metadata (`dc:title`, via the new `extract_epub_title()`) → the `Author - Title` download name (`parse_title_from_name()`, filename then SABnzbd job name). If no title can be found the original filename is kept verbatim, and a new `RENAME` config constant (default `True`) turns the behavior off entirely. A subtitle colon in the title becomes a ` - ` separator rather than being stripped (`The Final Empire: Mistborn Book One` → `… - The Final Empire - Mistborn Book One`), via a dedicated `sanitize_title()`. The EPUB author/title extractors now share `read_opf_root()`, and `sanitize_author()`/`sanitize_title()` are built on a general `sanitize_component()`. Documented in the README ("How renaming works" + Features/flow) and `CLAUDE.md`.
+
 ### Fixed
 - **History entry not being removed.** SABnzbd refuses to delete a job from history while that job's own post-processing script is still running, so the previous inline `mode=history&name=delete` call was silently ignored and the entry stayed in history. The delete is now **deferred to a detached child process** (`schedule_history_delete()` → `run_delayed_history_delete()` → `delete_history_now()`): the script spawns a fully detached copy of itself (own session, `/dev/null` stdio) that waits `HISTORY_DELETE_DELAY` seconds (default 30) until this script has exited and SABnzbd has marked the job finished, then makes the API call. New `HISTORY_DELETE_DELAY` config constant. Documented in the README ("What it does" + Troubleshooting) and `CLAUDE.md`.
 
