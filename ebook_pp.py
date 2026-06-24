@@ -5,7 +5,8 @@ ebook_pp.py - SABnzbd post-processing script for eBooks.
 After an eBook download finishes, this hook files it into a clean library and
 tidies up after SABnzbd:
 
-1. Moves the eBook file(s) to /media/Storage/eBooks/{Author Name}/
+1. Moves the eBook file(s) to {EBOOK_DEST}/{Author Name}/ (the in-container
+   mount of the NAS eBooks library, e.g. ${MEDIA_PATH}/eBooks -> /books)
 2. Deletes the leftover completed job folder under /downloads/completed
 3. Removes the job's entry from SABnzbd via the History API
 
@@ -33,7 +34,10 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 # === configuration ===
-EBOOK_DEST = "/media/Storage/eBooks"
+# Destination library root. This is the path *inside the SABnzbd container*; the
+# NAS eBooks share is bind-mounted here (e.g. compose: "${MEDIA_PATH}/eBooks:/books").
+# Books are filed under EBOOK_DEST/<Author Name>/.
+EBOOK_DEST = "/books"
 EBOOK_EXTS = (".epub", ".mobi", ".azw3", ".azw", ".pdf")
 UNKNOWN_AUTHOR = "Unknown Author"
 LOG_FILE = "/config/ebook_pp.log"
