@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **History entry not being removed.** SABnzbd refuses to delete a job from history while that job's own post-processing script is still running, so the previous inline `mode=history&name=delete` call was silently ignored and the entry stayed in history. The delete is now **deferred to a detached child process** (`schedule_history_delete()` → `run_delayed_history_delete()` → `delete_history_now()`): the script spawns a fully detached copy of itself (own session, `/dev/null` stdio) that waits `HISTORY_DELETE_DELAY` seconds (default 30) until this script has exited and SABnzbd has marked the job finished, then makes the API call. New `HISTORY_DELETE_DELAY` config constant. Documented in the README ("What it does" + Troubleshooting) and `CLAUDE.md`.
+
 ### Added
 - Initial release of `ebook_pp.py`, a SABnzbd post-processing script for eBooks. After a download finishes it files the eBook(s) into `{EBOOK_DEST}/{Author Name}/`, deletes the leftover completed job folder, and removes the job's entry from SABnzbd via the History API. Pure Python standard library — no external binaries or packages — so it runs as-is inside the stock `lscr.io/linuxserver/sabnzbd` image.
 - **Container-mounted library path:** `EBOOK_DEST` defaults to `/books`, the in-container mount of the NAS eBooks share (compose: `${MEDIA_PATH}/eBooks:/books`), rather than a host path the container can't see. Books are written through the bind mount onto the NAS.

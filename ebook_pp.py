@@ -8,7 +8,9 @@ tidies up after SABnzbd:
 1. Moves the eBook file(s) to {EBOOK_DEST}/{Author Name}/ (the in-container
    mount of the NAS eBooks library, e.g. ${MEDIA_PATH}/eBooks -> /books)
 2. Deletes the leftover completed job folder under /downloads/completed
-3. Removes the job's entry from SABnzbd via the History API
+3. Removes the job's entry from SABnzbd via the History API. This is deferred to
+   a detached child process, because SABnzbd won't delete a job from history
+   while its own post-processing script is still running.
 
 Author detection reads the EPUB metadata (dc:creator) first, then falls back to
 parsing the download name ("Author - Title"), then "Unknown Author".
@@ -26,7 +28,9 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +49,11 @@ DRY_RUN = False
 DELETE_FILES = 0          # del_files flag for the SAB history delete call (0 = entry only)
 API_TIMEOUT = 15          # seconds for the SABnzbd API call
 OVERWRITE = False         # if a dest file already exists, skip (non-destructive) by default
+# SABnzbd won't delete a job from history while its post-processing script is
+# still running, so the history delete is deferred to a detached child that
+# waits this many seconds (until this script has exited and the job is marked
+# finished) before calling the API.
+HISTORY_DELETE_DELAY = 30  # seconds
 # Fallback SABnzbd API URL, used only when the SAB_API_URL env var isn't set
 # (i.e. running the script outside SABnzbd). SABnzbd supplies SAB_API_URL at runtime.
 SAB_API_URL_DEFAULT = "https://nzb.example.com/api"
@@ -227,12 +236,14 @@ def delete_job_folder(job_dir, dry_run=False):
         log.error("  Failed to delete job folder %s: %s", job_dir, e)
         return False
 
-def sab_delete_history(nzo_id, api_key, api_url=None, dry_run=False):
-    """Remove the job's entry from SABnzbd via the History delete API.
+def delete_history_now(nzo_id, api_key, api_url=None):
+    """Issue the SABnzbd History delete API call immediately. Returns True on
+    success. Never raises - a failed call is logged and swallowed so it can't
+    fail the post-processing job.
 
-    Resolves the API URL from SAB_API_URL (env) or SAB_API_URL_DEFAULT. Skipped
-    with a warning if the nzo_id or API key is missing. Never raises - a failed
-    call is logged and swallowed so it can't fail the post-processing job."""
+    Note: SABnzbd ignores this for a job whose post-processing script is still
+    running, so the live pipeline calls it via schedule_history_delete() (a
+    deferred child); this is only invoked directly once the script has exited."""
     api_url = api_url or os.environ.get("SAB_API_URL") or SAB_API_URL_DEFAULT
     if not nzo_id or not api_key:
         log.warning("  Skipping SABnzbd history delete: missing nzo_id or API key.")
@@ -250,10 +261,6 @@ def sab_delete_history(nzo_id, api_key, api_url=None, dry_run=False):
     # Don't log the API key.
     safe_url = url.replace(api_key, "***")
 
-    if dry_run:
-        log.info("  DRY RUN: would call SABnzbd history delete: %s", safe_url)
-        return True
-
     try:
         with urllib.request.urlopen(url, timeout=API_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", errors="replace")
@@ -266,6 +273,59 @@ def sab_delete_history(nzo_id, api_key, api_url=None, dry_run=False):
     except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError) as e:
         log.error("  SABnzbd history delete call failed (%s): %s", safe_url, e)
         return False
+
+def schedule_history_delete(nzo_id, api_key, dry_run=False):
+    """Defer the SABnzbd history delete to a detached child process.
+
+    A job can't delete itself from history while its post-processing script is
+    still running (SABnzbd doesn't consider it finished), so we spawn a fully
+    detached copy of this script that sleeps HISTORY_DELETE_DELAY seconds - long
+    enough for this process to exit and the job to be marked finished - then
+    calls the API. The child has its own session and /dev/null stdio so SABnzbd
+    sees this script finish promptly. The nzo_id/API key/URL are read from the
+    inherited SAB_* environment by the child. Never raises."""
+    if not nzo_id or not api_key:
+        log.warning("  Skipping SABnzbd history delete: missing nzo_id or API key.")
+        return False
+
+    if dry_run:
+        log.info("  DRY RUN: would schedule SABnzbd history delete of %s in %ds.",
+                 nzo_id, HISTORY_DELETE_DELAY)
+        return True
+
+    try:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__),
+             "--delayed-history-delete", str(HISTORY_DELETE_DELAY)],
+            stdin=devnull, stdout=devnull, stderr=devnull,
+            start_new_session=True, close_fds=True,
+        )
+        os.close(devnull)
+        log.info("  Scheduled SABnzbd history delete of %s in %ds (pid %s).",
+                 nzo_id, HISTORY_DELETE_DELAY, proc.pid)
+        return True
+    except OSError as e:
+        log.error("  Could not schedule SABnzbd history delete: %s", e)
+        return False
+
+def run_delayed_history_delete():
+    """Entry point for the detached child spawned by schedule_history_delete():
+    wait out the delay, then delete the job from history. Reads the nzo_id, API
+    key and URL from the inherited SAB_* environment."""
+    setup_logging()
+    try:
+        delay = int(sys.argv[2])
+    except (IndexError, ValueError):
+        delay = HISTORY_DELETE_DELAY
+    time.sleep(delay)
+    log.info("Deferred history delete firing (waited %ds).", delay)
+    delete_history_now(
+        os.environ.get("SAB_NZO_ID"),
+        os.environ.get("SAB_API_KEY"),
+        os.environ.get("SAB_API_URL"),
+    )
+    return 0
 
 def main():
     setup_logging()
@@ -309,8 +369,10 @@ def main():
     log.info("All %d eBook(s) filed. Cleaning up.", moved)
 
     # Cleanup order: delete the completed folder, then drop the SABnzbd entry.
+    # The history delete is deferred to a detached child because SABnzbd won't
+    # remove a job while this post-processing script is still running.
     delete_job_folder(job_dir, DRY_RUN)
-    sab_delete_history(
+    schedule_history_delete(
         os.environ.get("SAB_NZO_ID"),
         os.environ.get("SAB_API_KEY"),
         dry_run=DRY_RUN,
@@ -320,4 +382,8 @@ def main():
     return 0
 
 if __name__ == "__main__":
+    # Detached child invoked by schedule_history_delete() to do the deferred
+    # history delete after this script has exited.
+    if len(sys.argv) > 1 and sys.argv[1] == "--delayed-history-delete":
+        sys.exit(run_delayed_history_delete())
     sys.exit(main())

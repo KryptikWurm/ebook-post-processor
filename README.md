@@ -143,6 +143,7 @@ LOG_FILE     = "/config/ebook_pp.log"            # change to a persistent path
 DRY_RUN      = False                             # True = log only, change nothing
 OVERWRITE    = False                             # True = replace existing books
 DELETE_FILES = 0                                 # del_files flag for the history delete
+HISTORY_DELETE_DELAY = 30                        # seconds to wait before the deferred history delete
 SAB_API_URL_DEFAULT = "https://nzb.example.com/api"  # fallback if SAB_API_URL is unset
 ```
 
@@ -155,7 +156,9 @@ For each finished download, in order:
 1. **Find the books.** Walk the completed job folder and collect the eBook-format files, ignoring everything else.
 2. **Resolve the author** for each book (metadata → name → `Unknown Author`).
 3. **Move** each book to `{EBOOK_DEST}/{Author Name}/` (the mounted NAS library, `/books` by default).
-4. **Only if every book moved cleanly:** delete the completed job folder under `/downloads/completed`, then remove the job's entry from SABnzbd via its History API (`del_files=0`, since the files are already gone).
+4. **Only if every book moved cleanly:** delete the completed job folder under `/downloads/completed`, then remove the job's entry from SABnzbd via its History API (`del_files=0`, since the files are already gone). The history removal is *deferred* — see below.
+
+> **Why the history removal is deferred.** SABnzbd won't delete a job from history while that job's own post-processing script is still running — it isn't considered "finished" yet, so a delete call made mid-script is silently ignored. To work around this, the script spawns a small detached background process that waits `HISTORY_DELETE_DELAY` seconds (30 by default), by which point this script has exited and SABnzbd has marked the job finished, and *then* makes the delete call. So the entry disappears from history a few seconds after the rest of the work completes, not instantly.
 
 If anything fails along the way, cleanup is skipped, the job is left untouched, and the script still exits 0.
 
@@ -177,7 +180,13 @@ That means neither the EPUB metadata nor the download name gave the script an au
 
 ### The SABnzbd entry isn't being removed
 
-The history-delete call needs `SAB_NZO_ID` and `SAB_API_KEY`, which SABnzbd only provides when the script runs as a real post-processing hook. If you're testing by hand they'll be missing and the script logs `Skipping SABnzbd history delete: missing nzo_id or API key` — that's expected. When it runs for real, check the log for the API response, and confirm `SAB_API_URL` (or `SAB_API_URL_DEFAULT`) points at the right host.
+First, it's removed **on a delay, on purpose.** SABnzbd refuses to delete a job from history while that job's post-processing script is still running, so the script defers the delete to a detached background process that fires `HISTORY_DELETE_DELAY` seconds (30 by default) *after* the script exits. Give it that long before concluding it didn't work — in the log you'll see `Scheduled SABnzbd history delete … in 30s` immediately, then `Removed SABnzbd history entry …` about 30 seconds later.
+
+If the entry still isn't gone after the delay:
+
+- **Missing credentials.** The delete needs `SAB_NZO_ID` and `SAB_API_KEY`, which SABnzbd only provides when the script runs as a real post-processing hook. Testing by hand, they'll be absent and you'll see `Skipping SABnzbd history delete: missing nzo_id or API key` — expected.
+- **Wrong API URL.** Confirm `SAB_API_URL` (or `SAB_API_URL_DEFAULT`) points at the right host. The deferred process logs the API response (with the key redacted) so you can see what came back.
+- **Delay too short.** If your post-processing finalization is slow, bump `HISTORY_DELETE_DELAY` so the delete lands comfortably after the job is marked finished.
 
 ### `Destination already exists, skipping`
 
