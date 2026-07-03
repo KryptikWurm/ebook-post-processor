@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -57,8 +58,11 @@ RENAME = True             # rename filed eBooks to "{Author} - {Title}{ext}"; ke
 # finished) before calling the API.
 HISTORY_DELETE_DELAY = 30  # seconds
 # Fallback SABnzbd API URL, used only when the SAB_API_URL env var isn't set
-# (i.e. running the script outside SABnzbd). SABnzbd supplies SAB_API_URL at runtime.
-SAB_API_URL_DEFAULT = "https://nzb.example.com/api"
+# (i.e. running the script outside SABnzbd). SABnzbd supplies SAB_API_URL at
+# runtime, so this can normally stay empty; set it to your instance's API
+# endpoint (e.g. "http://localhost:8080/api") to test the history delete by
+# hand. With neither set, the history delete is skipped with a warning.
+SAB_API_URL_DEFAULT = ""
 
 log = logging.getLogger("ebook_pp")
 
@@ -135,15 +139,10 @@ def read_opf_root(path):
         log.debug("  EPUB metadata read failed on %s: %s", os.path.basename(path), e)
         return None
 
-def extract_epub_author(path):
-    """Return the author named in an EPUB's metadata (dc:creator), or None.
+def opf_author(opf):
+    """Return the author named in a parsed OPF root (dc:creator), or None.
 
-    Parses the OPF's <dc:creator> entries, preferring one tagged with the 'aut'
-    role. Returns None on any structural problem so the caller can fall back to
-    filename parsing."""
-    opf = read_opf_root(path)
-    if opf is None:
-        return None
+    Prefers a <dc:creator> tagged with the 'aut' role."""
     creators = opf.findall(".//dc:creator", OPF_NS)
     if not creators:
         return None
@@ -158,18 +157,22 @@ def extract_epub_author(path):
             return c.text.strip()
     return None
 
-def extract_epub_title(path):
-    """Return the title named in an EPUB's metadata (dc:title), or None.
-
-    Returns None on any structural problem so the caller can fall back to
-    filename parsing."""
-    opf = read_opf_root(path)
-    if opf is None:
-        return None
+def opf_title(opf):
+    """Return the title named in a parsed OPF root (dc:title), or None."""
     for t in opf.findall(".//dc:title", OPF_NS):
         if (t.text or "").strip():
             return t.text.strip()
     return None
+
+def extract_epub_metadata(path):
+    """Return (author, title) from an EPUB's metadata; either may be None.
+
+    Opens and parses the EPUB once for both values. Returns (None, None) on any
+    structural problem so the caller can fall back to filename parsing."""
+    opf = read_opf_root(path)
+    if opf is None:
+        return None, None
+    return opf_author(opf), opf_title(opf)
 
 def _strip_ebook_ext(name):
     """Drop a trailing eBook extension from a name, if present."""
@@ -223,16 +226,15 @@ def sanitize_title(name):
     cleaned = sanitize_component(name)
     return re.sub(r"\s*-\s*$", "", cleaned).strip()
 
-def determine_author(path, job_name):
+def determine_author(path, job_name, epub_author=None):
     """Resolve the destination author folder for an eBook.
 
-    EPUB metadata first, then 'Author - Title' parsing of the filename and the
-    SABnzbd job name, then UNKNOWN_AUTHOR. The result is always sanitized."""
-    author = None
-    if path.lower().endswith(".epub"):
-        author = extract_epub_author(path)
-        if author:
-            log.info("  Author from EPUB metadata: %s", author)
+    EPUB metadata (pre-extracted by the caller) first, then 'Author - Title'
+    parsing of the filename and the SABnzbd job name, then UNKNOWN_AUTHOR. The
+    result is always sanitized."""
+    author = epub_author
+    if author:
+        log.info("  Author from EPUB metadata: %s", author)
     if not author:
         author = parse_author_from_name(os.path.basename(path))
         if not author and job_name:
@@ -243,17 +245,16 @@ def determine_author(path, job_name):
         log.warning("  Author not found; using %r.", UNKNOWN_AUTHOR)
     return sanitize_author(author)
 
-def determine_title(path, job_name):
+def determine_title(path, job_name, epub_title=None):
     """Resolve the book title for renaming, or None if it can't be found.
 
-    EPUB metadata first, then 'Author - Title' parsing of the filename and the
-    SABnzbd job name. Returns None (caller keeps the original filename) when no
-    title can be determined; the result is otherwise raw (sanitized at use)."""
-    title = None
-    if path.lower().endswith(".epub"):
-        title = extract_epub_title(path)
-        if title:
-            log.info("  Title from EPUB metadata: %s", title)
+    EPUB metadata (pre-extracted by the caller) first, then 'Author - Title'
+    parsing of the filename and the SABnzbd job name. Returns None (caller keeps
+    the original filename) when no title can be determined; the result is
+    otherwise raw (sanitized at use)."""
+    title = epub_title
+    if title:
+        log.info("  Title from EPUB metadata: %s", title)
     if not title:
         title = parse_title_from_name(os.path.basename(path))
         if not title and job_name:
@@ -294,17 +295,29 @@ def move_ebook(path, author, dest_name=None, dry_run=False):
         log.info("  DRY RUN: would move -> %s", dest)
         return True
 
+    # The job folder and EBOOK_DEST are usually different mounts, so the move
+    # degrades to copy+delete. Stage the copy under a temp name in the
+    # destination directory and rename into place, so an interrupted copy can
+    # never leave a truncated book at the final name (which the exists-check
+    # above would treat as the real copy on a retry).
+    tmp = None
     try:
         os.makedirs(dest_dir, exist_ok=True)
-        # If overwriting, remove the existing dest first so move can't fail/merge.
-        if os.path.exists(dest) and OVERWRITE:
-            os.remove(dest)
-        shutil.move(path, dest)
+        fd, tmp = tempfile.mkstemp(prefix=".ebook_pp_", dir=dest_dir)
+        os.close(fd)
+        shutil.move(path, tmp)
+        os.replace(tmp, dest)
         log.info("  Moved -> %s", dest)
         return True
     except OSError as e:
         log.error("  Failed to move %s -> %s: %s", os.path.basename(path), dest, e)
         return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 def delete_job_folder(job_dir, dry_run=False):
     """Recursively delete the completed job folder. Returns True on success."""
@@ -330,6 +343,10 @@ def delete_history_now(nzo_id, api_key, api_url=None):
     api_url = api_url or os.environ.get("SAB_API_URL") or SAB_API_URL_DEFAULT
     if not nzo_id or not api_key:
         log.warning("  Skipping SABnzbd history delete: missing nzo_id or API key.")
+        return False
+    if not api_url:
+        log.warning("  Skipping SABnzbd history delete: no API URL "
+                    "(set SAB_API_URL or SAB_API_URL_DEFAULT).")
         return False
 
     params = {
@@ -437,8 +454,10 @@ def main():
     for path in ebooks:
         log.info("Filing: %s", os.path.basename(path))
         try:
-            author = determine_author(path, job_name)
-            dest_name = target_filename(path, author, determine_title(path, job_name))
+            epub_author, epub_title = (extract_epub_metadata(path)
+                                       if path.lower().endswith(".epub") else (None, None))
+            author = determine_author(path, job_name, epub_author)
+            dest_name = target_filename(path, author, determine_title(path, job_name, epub_title))
             if dest_name != os.path.basename(path):
                 log.info("  Filing as: %s", dest_name)
             if move_ebook(path, author, dest_name, DRY_RUN):

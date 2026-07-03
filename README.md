@@ -157,8 +157,10 @@ OVERWRITE    = False                             # True = replace existing books
 RENAME       = True                              # rename to "Author - Title"; keep original name if no title
 DELETE_FILES = 0                                 # del_files flag for the history delete
 HISTORY_DELETE_DELAY = 30                        # seconds to wait before the deferred history delete
-SAB_API_URL_DEFAULT = "https://nzb.example.com/api"  # fallback if SAB_API_URL is unset
+SAB_API_URL_DEFAULT = ""                         # optional fallback if SAB_API_URL is unset (see below)
 ```
+
+`SAB_API_URL_DEFAULT` can stay empty for normal use: SABnzbd hands the script its own API URL via the `SAB_API_URL` environment variable on every run. Set it (e.g. `"http://localhost:8080/api"`) only if you want to test the history delete by running the script outside SABnzbd. With neither set, the history delete is skipped with a warning — nothing else is affected.
 
 Always do a dry run first on a new setup (`DRY_RUN = True`). Look at the log, confirm it's filing books where you expect and resolving authors correctly, then set it loose.
 
@@ -198,8 +200,9 @@ First, it's removed **on a delay, on purpose.** SABnzbd refuses to delete a job 
 If the entry still isn't gone after the delay:
 
 - **Missing credentials.** The delete needs `SAB_NZO_ID` and `SAB_API_KEY`, which SABnzbd only provides when the script runs as a real post-processing hook. Testing by hand, they'll be absent and you'll see `Skipping SABnzbd history delete: missing nzo_id or API key` — expected.
-- **Wrong API URL.** Confirm `SAB_API_URL` (or `SAB_API_URL_DEFAULT`) points at the right host. The deferred process logs the API response (with the key redacted) so you can see what came back.
+- **Wrong or missing API URL.** SABnzbd supplies `SAB_API_URL` at runtime; running by hand you'll need to set it (or `SAB_API_URL_DEFAULT`) yourself, otherwise the delete is skipped with `Skipping SABnzbd history delete: no API URL`. The deferred process logs the API response (with the key redacted) so you can see what came back.
 - **Delay too short.** If your post-processing finalization is slow, bump `HISTORY_DELETE_DELAY` so the delete lands comfortably after the job is marked finished.
+- **Container restarted during the delay.** The deferred delete runs as a detached process inside the SABnzbd container; if the container restarts within the `HISTORY_DELETE_DELAY` window, that process dies with it and the entry stays. Harmless — it just remains in history.
 
 ### `Destination already exists, skipping`
 
